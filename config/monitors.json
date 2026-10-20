@@ -1,0 +1,32 @@
+{
+  "monitors": [
+    {
+      "name": "ASUS ROG Strix OLED XG32UCWMG",
+      "model": "XG32UCWMG",
+      "amazon": "https://www.amazon.de/dp/B0BSH3JKQB",
+      "mediamarkt": "https://www.mediamarkt.de/de/product/_asus-xg32ucwmg-315-zoll-uhd-4k-monitor-003-ms-reaktionszeit-240-hz-3028242.html",
+      "idealo": "https://www.idealo.de/preisvergleich/OffersOfProduct/207227718_-rog-strix-oled-xg32ucwmg-asus.html"
+    },
+    {
+      "name": "Samsung Odyssey OLED G8 G80SD",
+      "model": "LS32DG800SUXEN",
+      "amazon": "https://www.amazon.de/dp/B0D49Z3N9K",
+      "mediamarkt": "https://www.mediamarkt.de/de/product/_samsung-ls32dg800suxen32gamuhd-4k-240hzergo-32-zoll-uhd-4k-odyssey-gaming-monitor-003-ms-reaktionszeit-240-hz-nativ-145822278.html",
+      "idealo": "https://www.idealo.de/preisvergleich/OffersOfProduct/204411207_-odyssey-oled-g80sd-ls32dg800suxen-samsung.html"
+    },
+    {
+      "name": "LG UltraGear OLED 32GX850A-B",
+      "model": "32GX850A-B",
+      "amazon": "https://www.amazon.de/dp/B0FT3P9Q36",
+      "mediamarkt": "https://www.mediamarkt.de/de/product/_lg-32gx850a-baeu-32-zoll-uhd-4k-monitor-003-ms-reaktionszeit-165-hz-166246337.html",
+      "idealo": "https://www.idealo.de/preisvergleich/OffersOfProduct/208346364_-ultragear-oled-32gx850a-b-lg-electronics.html"
+    },
+    {
+      "name": "LG UltraGear 32GS94UX-B",
+      "model": "32GS94UX-B",
+      "amazon": "https://www.amazon.de/dp/B0DK6Z1869",
+      "mediamarkt": "https://www.mediamarkt.de/de/product/_lg-32gs94ux-b-315in-80cm-3840x2160-275cd-hdmi-003m-315-zoll-uhd-4k-gaming-monitor-003-ms-reaktionszeit-480-hz-60-hz-nativ-149400538.html",
+      "idealo": "https://www.idealo.de/preisvergleich/OffersOfProduct/205167070_-32gs94ux-b-lg-electronics.html"
+    }
+  ]
+}

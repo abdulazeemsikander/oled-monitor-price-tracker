@@ -43,11 +43,9 @@ For Gmail SMTP, enable 2-Step Verification and create an App Password. Put the 1
 
 ## Current price table
 
-The table below is automatically replaced after each successful hourly run.
-
 | Monitor | Amazon.de | MediaMarkt.de | Idealo.de | Last check |
 |---|---:|---:|---:|---|
-| ASUS ROG Strix OLED XG32UCWMG | `NOT_CHECKED_YET` | `NOT_CHECKED_YET` | `NOT_CHECKED_YET` | — |
-| Samsung Odyssey OLED G8 G80SD | `NOT_CHECKED_YET` | `NOT_CHECKED_YET` | `NOT_CHECKED_YET` | — |
-| LG UltraGear OLED 32GX850A-B | `NOT_CHECKED_YET` | `NOT_CHECKED_YET` | `NOT_CHECKED_YET` | — |
-| LG UltraGear 32GS94UX-B | `NOT_CHECKED_YET` | `NOT_CHECKED_YET` | `NOT_CHECKED_YET` | — |
+| ASUS ROG Strix OLED XG32UCWMG | `AMAZON_BOT_CHECK` | `HTTP_ERROR: HTTPError` | `HTTP_ERROR: HTTPError` | 2026-10-20T11:03+00:00 |
+| Samsung Odyssey OLED G8 G80SD | `AMAZON_BOT_CHECK` | `HTTP_ERROR: HTTPError` | `HTTP_ERROR: HTTPError` | 2026-10-20T11:03+00:00 |
+| LG UltraGear OLED 32GX850A-B | `AMAZON_BOT_CHECK` | `HTTP_ERROR: HTTPError` | `HTTP_ERROR: HTTPError` | 2026-10-20T11:03+00:00 |
+| LG UltraGear 32GS94UX-B | `AMAZON_BOT_CHECK` | `HTTP_ERROR: HTTPError` | `HTTP_ERROR: HTTPError` | 2026-10-20T11:03+00:00 |

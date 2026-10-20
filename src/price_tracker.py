@@ -1028,6 +1028,22 @@ def main():
                     f"({status})"
                 )
 
+            if price is None:
+    try:
+        title = page.title()
+        body_sample = page.locator("body").inner_text(
+            timeout=5000
+        )[:1500]
+
+        print(f"  Page title: {title}")
+        print("  Page text sample:")
+        print(body_sample)
+    except Exception as exc:
+        print(
+            f"  Could not collect diagnostic page text: "
+            f"{type(exc).__name__}"
+        )
+
             new_state["monitors"].append({
                 "name": monitor["name"],
                 "model": monitor["model"],

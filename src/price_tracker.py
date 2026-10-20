@@ -10,25 +10,41 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
+
+# ============================================================
+# PATHS
+# ============================================================
 
 ROOT = Path(__file__).resolve().parents[1]
+
 CONFIG = ROOT / "config" / "monitors.json"
 STATE = ROOT / "data" / "state.json"
 README = ROOT / "README.md"
 
 
-HEADERS = {
+# ============================================================
+# BROWSER SETTINGS
+# ============================================================
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/142.0.0.0 Safari/537.36"
+)
+
+BROWSER_HEADERS = {
     "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
 }
 
 
-# ---------------------------------------------------------
-# JSON / FILE HELPERS
-# ---------------------------------------------------------
+# ============================================================
+# FILE HELPERS
+# ============================================================
 
 def load_json(path, default):
+    """Load JSON safely."""
     if not path.exists():
         return default
 
@@ -39,58 +55,99 @@ def load_json(path, default):
 
 
 def save_json(path, data):
+    """Save JSON with readable formatting."""
     path.parent.mkdir(parents=True, exist_ok=True)
+
     path.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
-        encoding="utf-8"
+        json.dumps(
+            data,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
     )
 
 
-# ---------------------------------------------------------
+# ============================================================
 # PRICE PARSING
-# ---------------------------------------------------------
+# ============================================================
 
 def parse_price(value):
+    """
+    Convert German/international price strings to float.
+
+    Examples:
+        799,99 €       -> 799.99
+        1.299,99 €     -> 1299.99
+        799.99 €       -> 799.99
+        EUR 799.99     -> 799.99
+        799.99         -> 799.99
+    """
+
     if value is None:
         return None
 
-    text = str(value).replace("\xa0", " ").strip()
+    text = str(value)
 
-    # German format: 1.234,56 €
+    text = (
+        text.replace("\xa0", " ")
+        .replace("\u202f", " ")
+        .strip()
+    )
+
+    # --------------------------------------------------------
+    # German format
+    # 799,99
+    # 1.299,99
+    # --------------------------------------------------------
+
     match = re.search(
-        r"(\d{1,5}(?:[.\s]\d{3})*,\d{2})\s*€?",
-        text
+        r"(\d{1,5}(?:[.\s]\d{3})*,\d{2})",
+        text,
     )
 
     if match:
-        cleaned = (
-            match.group(1)
-            .replace(".", "")
+        raw = match.group(1)
+
+        raw = (
+            raw.replace(".", "")
             .replace(" ", "")
             .replace(",", ".")
         )
 
         try:
-            return float(cleaned)
+            return float(raw)
         except ValueError:
             pass
 
-    # International format: 1,234.56 €
+    # --------------------------------------------------------
+    # International format
+    # 799.99
+    # 1,299.99
+    # --------------------------------------------------------
+
     match = re.search(
-        r"(\d{1,5}(?:,\d{3})*\.\d{2})\s*€?",
-        text
+        r"(\d{1,5}(?:,\d{3})*\.\d{2})",
+        text,
     )
 
     if match:
+        raw = match.group(1)
+
+        raw = raw.replace(",", "")
+
         try:
-            return float(match.group(1).replace(",", ""))
+            return float(raw)
         except ValueError:
             pass
 
-    # Plain decimal value
+    # --------------------------------------------------------
+    # Plain decimal
+    # --------------------------------------------------------
+
     match = re.fullmatch(
         r"\s*(\d{2,5}(?:[.,]\d{1,2})?)\s*",
-        text
+        text,
     )
 
     if match:
@@ -104,16 +161,21 @@ def parse_price(value):
         except ValueError:
             pass
 
-    # € 799 / EUR 799
+    # --------------------------------------------------------
+    # EUR / € before number
+    # --------------------------------------------------------
+
     match = re.search(
-        r"(?:€|EUR)\s*(\d{2,5})(?:\s|$)",
+        r"(?:€|EUR)\s*(\d{2,5}(?:[.,]\d{1,2})?)",
         text,
-        flags=re.I
+        flags=re.IGNORECASE,
     )
 
     if match:
+        raw = match.group(1)
+
         try:
-            return float(match.group(1))
+            return float(raw.replace(",", "."))
         except ValueError:
             pass
 
@@ -121,415 +183,816 @@ def parse_price(value):
 
 
 def valid_price(price):
-    return price is not None and 50 <= price <= 5000
+    """
+    Prevent obvious false positives.
+
+    Gaming monitors in this tracker should normally fall
+    somewhere between €50 and €5000.
+    """
+
+    return (
+        price is not None
+        and 50 <= price <= 5000
+    )
 
 
-# ---------------------------------------------------------
-# JSON-LD
-# ---------------------------------------------------------
+# ============================================================
+# PRICE EXTRACTION FROM TEXT
+# ============================================================
 
-def jsonld_prices(soup):
+def extract_prices_from_text(text):
+    """
+    Extract possible prices from page text.
+
+    Returns a list of valid prices.
+    """
+
+    if not text:
+        return []
+
+    text = (
+        text.replace("\xa0", " ")
+        .replace("\u202f", " ")
+    )
+
+    candidates = []
+
+    # German prices:
+    # 799,99 €
+    # 1.299,99 €
+    candidates.extend(
+        re.findall(
+            r"\b\d{1,5}(?:[.\s]\d{3})*,\d{2}\s*€",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    # International prices:
+    # 799.99 €
+    # 1,299.99 €
+    candidates.extend(
+        re.findall(
+            r"\b\d{1,5}(?:,\d{3})*\.\d{2}\s*€",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    # EUR format
+    candidates.extend(
+        re.findall(
+            r"(?:€|EUR)\s*\d{2,5}(?:[.,]\d{2})?",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
     prices = []
 
-    for script in soup.select('script[type="application/ld+json"]'):
+    for candidate in candidates:
+        price = parse_price(candidate)
+
+        if valid_price(price):
+            prices.append(price)
+
+    return prices
+
+
+# ============================================================
+# JSON-LD PRICE EXTRACTION
+# ============================================================
+
+def extract_jsonld_prices(soup):
+    """
+    Extract product prices from JSON-LD structured data.
+    """
+
+    prices = []
+
+    scripts = soup.select(
+        'script[type="application/ld+json"]'
+    )
+
+    for script in scripts:
         try:
-            data = json.loads(
-                script.string or script.get_text()
-            )
+            raw = script.string or script.get_text()
+
+            data = json.loads(raw)
+
         except Exception:
             continue
 
-        stack = data if isinstance(data, list) else [data]
+        stack = []
+
+        if isinstance(data, list):
+            stack.extend(data)
+        else:
+            stack.append(data)
 
         while stack:
+
             item = stack.pop()
 
             if isinstance(item, dict):
 
-                if "offers" in item:
-                    offers = item["offers"]
+                # Direct price
+                if "price" in item:
 
-                    if isinstance(offers, list):
-                        stack.extend(offers)
-                    else:
-                        stack.append(offers)
-
-                if isinstance(item.get("price"), (str, int, float)):
-                    price = parse_price(item["price"])
+                    price = parse_price(
+                        item.get("price")
+                    )
 
                     if valid_price(price):
                         prices.append(price)
 
+                # Offers
+                if "offers" in item:
+
+                    offers = item["offers"]
+
+                    if isinstance(offers, list):
+                        stack.extend(offers)
+
+                    elif isinstance(offers, dict):
+                        stack.append(offers)
+
+                # Nested dictionaries/lists
                 for value in item.values():
-                    if isinstance(value, (dict, list)):
+
+                    if isinstance(value, dict):
                         stack.append(value)
 
+                    elif isinstance(value, list):
+                        stack.extend(value)
+
             elif isinstance(item, list):
+
                 stack.extend(item)
 
     return prices
 
 
-# ---------------------------------------------------------
-# AMAZON
-# ---------------------------------------------------------
+# ============================================================
+# PAGE PRICE EXTRACTION
+# ============================================================
 
-def amazon_price(soup):
-    selectors = [
-        "#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-price) .a-offscreen",
-        "#corePrice_feature_div .a-price:not(.a-text-price) .a-offscreen",
-        "#apex_desktop .a-price:not(.a-text-price) .a-offscreen",
-        "#price_inside_buybox .a-offscreen",
-        "#priceblock_ourprice",
-        "#priceblock_dealprice",
-        "[data-a-color='price'] .a-offscreen",
-    ]
+def extract_prices_from_page(page, source):
+    """
+    Extract possible prices from the rendered browser page.
+
+    We use several methods because Amazon, MediaMarkt and
+    Idealo do not expose their prices in exactly the same way.
+    """
+
+    prices = []
+
+    # --------------------------------------------------------
+    # 1. Rendered page text
+    # --------------------------------------------------------
+
+    try:
+        body_text = page.locator("body").inner_text(
+            timeout=10000
+        )
+
+        prices.extend(
+            extract_prices_from_text(body_text)
+        )
+
+    except Exception:
+        body_text = ""
+
+    # --------------------------------------------------------
+    # 2. HTML / JSON-LD
+    # --------------------------------------------------------
+
+    try:
+        html = page.content()
+
+        soup = BeautifulSoup(
+            html,
+            "html.parser",
+        )
+
+        prices.extend(
+            extract_jsonld_prices(soup)
+        )
+
+        # itemprop price
+        for tag in soup.select(
+            '[itemprop="price"]'
+        ):
+
+            if tag.get("content"):
+
+                price = parse_price(
+                    tag.get("content")
+                )
+
+                if valid_price(price):
+                    prices.append(price)
+
+            text = tag.get_text(
+                " ",
+                strip=True,
+            )
+
+            price = parse_price(text)
+
+            if valid_price(price):
+                prices.append(price)
+
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # 3. Source-specific selectors
+    # --------------------------------------------------------
+
+    selectors = []
+
+    if source == "amazon":
+
+        selectors = [
+            "#corePriceDisplay_desktop_feature_div "
+            ".a-price:not(.a-text-price) .a-offscreen",
+
+            "#corePrice_feature_div "
+            ".a-price:not(.a-text-price) .a-offscreen",
+
+            "#apex_desktop "
+            ".a-price:not(.a-text-price) .a-offscreen",
+
+            "#price_inside_buybox .a-offscreen",
+
+            "#priceblock_ourprice",
+
+            "#priceblock_dealprice",
+
+            "[data-a-color='price'] .a-offscreen",
+
+            ".a-price .a-offscreen",
+        ]
+
+    elif source == "mediamarkt":
+
+        selectors = [
+            '[data-test="mms-price"]',
+
+            '[data-testid="price"]',
+
+            '[data-test*="price"]',
+
+            '[class*="price"]',
+
+            '[class*="Price"]',
+
+            '[class*="priceContainer"]',
+
+            '[class*="PriceContainer"]',
+        ]
+
+    elif source == "idealo":
+
+        selectors = [
+            '[data-testid*="price"]',
+
+            '[data-test*="price"]',
+
+            '[class*="price"]',
+
+            '[class*="Price"]',
+
+            '[class*="offer"]',
+
+            '[class*="Offer"]',
+        ]
+
+    # --------------------------------------------------------
+    # Read source-specific selectors
+    # --------------------------------------------------------
 
     for selector in selectors:
-        for element in soup.select(selector):
-            price = parse_price(
-                element.get_text(" ", strip=True)
+
+        try:
+
+            elements = page.locator(selector)
+
+            count = min(
+                elements.count(),
+                100,
             )
 
-            if valid_price(price):
-                return price
+            for index in range(count):
 
-    # Whole + fraction
-    for container in soup.select(
-        "#corePriceDisplay_desktop_feature_div .a-price, "
-        "#corePrice_feature_div .a-price"
-    ):
-        whole = container.select_one(".a-price-whole")
-        fraction = container.select_one(".a-price-fraction")
+                try:
 
-        if whole and fraction:
-            price = parse_price(
-                f"{whole.get_text(strip=True)}."
-                f"{fraction.get_text(strip=True)}"
+                    text = elements.nth(
+                        index
+                    ).inner_text(
+                        timeout=2000
+                    )
+
+                    prices.extend(
+                        extract_prices_from_text(
+                            text
+                        )
+                    )
+
+                except Exception:
+                    continue
+
+        except Exception:
+            continue
+
+    # --------------------------------------------------------
+    # Remove duplicates
+    # --------------------------------------------------------
+
+    unique_prices = []
+
+    for price in prices:
+
+        rounded = round(price, 2)
+
+        if rounded not in unique_prices:
+            unique_prices.append(rounded)
+
+    return unique_prices
+
+
+# ============================================================
+# SOURCE-SPECIFIC PRICE SELECTION
+# ============================================================
+
+def choose_best_price(prices, source):
+    """
+    Choose the most likely current product price.
+
+    Idealo:
+        Usually "ab €XXX" = lowest current offer.
+
+    MediaMarkt:
+        Usually the product page has one primary price.
+
+    Amazon:
+        Prefer the lowest valid price returned by the
+        current-price selectors.
+    """
+
+    if not prices:
+        return None
+
+    prices = [
+        p
+        for p in prices
+        if valid_price(p)
+    ]
+
+    if not prices:
+        return None
+
+    # --------------------------------------------------------
+    # Idealo
+    # --------------------------------------------------------
+
+    if source == "idealo":
+        return min(prices)
+
+    # --------------------------------------------------------
+    # MediaMarkt
+    # --------------------------------------------------------
+
+    if source == "mediamarkt":
+
+        # Product prices should normally be in this range.
+        # Selecting the minimum also avoids accidentally
+        # picking an old/list price.
+        return min(prices)
+
+    # --------------------------------------------------------
+    # Amazon
+    # --------------------------------------------------------
+
+    if source == "amazon":
+        return min(prices)
+
+    return min(prices)
+
+
+# ============================================================
+# PAGE DIAGNOSTICS
+# ============================================================
+
+def diagnose_page(page, source):
+    """
+    Print useful information when price extraction fails.
+
+    This is intentionally printed into GitHub Actions logs.
+    """
+
+    print("")
+    print("  ---------- DIAGNOSTIC ----------")
+
+    try:
+        title = page.title()
+
+        print(f"  Page title: {title}")
+
+    except Exception as exc:
+
+        print(
+            "  Page title unavailable: "
+            f"{type(exc).__name__}"
+        )
+
+    try:
+        url = page.url
+
+        print(f"  Final URL: {url}")
+
+    except Exception:
+        pass
+
+    try:
+
+        body_text = page.locator(
+            "body"
+        ).inner_text(
+            timeout=5000
+        )
+
+        body_text = body_text.strip()
+
+        print("  Page text sample:")
+
+        if body_text:
+
+            print(
+                body_text[:2500]
             )
 
-            if valid_price(price):
-                return price
+        else:
 
-    # JSON-LD fallback
-    prices = jsonld_prices(soup)
+            print(
+                "  <EMPTY PAGE BODY>"
+            )
 
-    if prices:
-        return prices[0]
+    except Exception as exc:
+
+        print(
+            "  Could not collect page text: "
+            f"{type(exc).__name__}"
+        )
+
+    print(
+        f"  Source: {source}"
+    )
+
+    print(
+        "  --------------------------------"
+    )
+
+
+# ============================================================
+# BOT / BLOCK DETECTION
+# ============================================================
+
+def detect_block(page, source):
+    """
+    Detect common block/challenge pages.
+    """
+
+    try:
+
+        title = page.title().lower()
+
+    except Exception:
+
+        title = ""
+
+    try:
+
+        text = page.locator(
+            "body"
+        ).inner_text(
+            timeout=5000
+        ).lower()
+
+    except Exception:
+
+        text = ""
+
+    combined = (
+        title
+        + "\n"
+        + text[:10000]
+    )
+
+    # Amazon
+    if source == "amazon":
+
+        amazon_markers = [
+            "robot check",
+            "enter the characters you see",
+            "type the characters",
+            "captcha",
+            "sorry, we just need to make sure",
+            "automated access",
+        ]
+
+        for marker in amazon_markers:
+
+            if marker in combined:
+
+                return (
+                    "AMAZON_BOT_CHECK"
+                )
+
+    # General blocking
+    block_markers = [
+        "access denied",
+        "request blocked",
+        "forbidden",
+        "too many requests",
+        "unusual traffic",
+        "security check",
+        "checking your browser",
+    ]
+
+    for marker in block_markers:
+
+        if marker in combined:
+
+            return (
+                "SITE_BLOCKED"
+            )
 
     return None
 
 
-def fetch_amazon(page, url):
-    try:
-        page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=45000
-        )
+# ============================================================
+# BROWSER PAGE LOADING
+# ============================================================
 
-        page.wait_for_timeout(3000)
+def load_page(browser, url, source):
+    """
+    Open a page using Playwright.
 
-    except Exception as exc:
-        return None, f"HTTP_ERROR: {type(exc).__name__}"
+    Returns:
+        page, status
+    """
 
-    text = page.locator("body").inner_text(
-        timeout=10000
-    ).lower()
-
-    bot_words = [
-        "captcha",
-        "robot check",
-        "enter the characters you see",
-        "type the characters",
-        "are you a robot",
-    ]
-
-    if any(word in text for word in bot_words):
-        return None, "AMAZON_BOT_CHECK"
-
-    soup = BeautifulSoup(
-        page.content(),
-        "html.parser"
+    context = browser.new_context(
+        user_agent=USER_AGENT,
+        locale="de-DE",
+        timezone_id="Europe/Berlin",
+        extra_http_headers=BROWSER_HEADERS,
+        viewport={
+            "width": 1440,
+            "height": 1000,
+        },
+        java_script_enabled=True,
     )
 
-    price = amazon_price(soup)
+    page = context.new_page()
 
-    if price is not None:
-        return price, "OK"
+    try:
 
-    return None, "AMAZON_PRICE_NOT_FOUND"
+        print(
+            f"  Opening: {url}"
+        )
 
+        response = page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
 
-# ---------------------------------------------------------
-# MEDIAMARKT
-# ---------------------------------------------------------
+        # Give dynamic pages time to render.
+        page.wait_for_timeout(5000)
 
-def mediamarkt_price(soup, page):
-    candidates = []
-
-    selectors = [
-        '[data-test="product-price"]',
-        '[data-testid="product-price"]',
-        '[data-test*="price"]',
-        '[data-testid*="price"]',
-        '[class*="price"]',
-        '[class*="Price"]',
-    ]
-
-    for selector in selectors:
+        # Try network-idle, but don't fail if the site
+        # continuously loads resources.
         try:
-            elements = soup.select(selector)
 
-            for element in elements[:100]:
-
-                # Ignore prices inside strike/del elements
-                if element.find_parent(["del", "s", "strike"]):
-                    continue
-
-                text = element.get_text(
-                    " ",
-                    strip=True
-                )
-
-                if "€" not in text and "EUR" not in text:
-                    continue
-
-                price = parse_price(text)
-
-                if valid_price(price):
-                    candidates.append(price)
+            page.wait_for_load_state(
+                "networkidle",
+                timeout=15000,
+            )
 
         except Exception:
-            continue
+            pass
 
-    # Structured metadata
-    for element in soup.select(
-        '[itemprop="price"]'
-    ):
-        value = element.get("content")
-
-        if value:
-            price = parse_price(value)
-
-            if valid_price(price):
-                candidates.append(price)
-
-    # JSON-LD
-    candidates.extend(
-        jsonld_prices(soup)
-    )
-
-    # Remove duplicates
-    candidates = sorted(
-        set(round(p, 2) for p in candidates)
-    )
-
-    if not candidates:
-        return None
-
-    # Prefer prices around the normal monitor price range.
-    # Do not blindly use every number found on the page.
-    sensible = [
-        p for p in candidates
-        if 100 <= p <= 3000
-    ]
-
-    if sensible:
-        return sensible[0]
-
-    return candidates[0]
-
-
-def fetch_mediamarkt(page, url):
-    try:
-        page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=45000
-        )
-
-        page.wait_for_timeout(4000)
-
-    except Exception as exc:
-        return None, f"HTTP_ERROR: {type(exc).__name__}"
-
-    body_text = page.locator("body").inner_text(
-        timeout=10000
-    )
-
-    lower = body_text.lower()
-
-    if (
-        "access denied" in lower
-        or "forbidden" in lower
-        or "request blocked" in lower
-    ):
-        return None, "MEDIAMARKT_BLOCKED"
-
-    soup = BeautifulSoup(
-        page.content(),
-        "html.parser"
-    )
-
-    price = mediamarkt_price(
-        soup,
-        page
-    )
-
-    if price is not None:
-        return price, "OK"
-
-    return None, "MEDIAMARKT_PRICE_NOT_FOUND"
-
-
-# ---------------------------------------------------------
-# IDEALO
-# ---------------------------------------------------------
-
-def idealo_price(soup, page):
-    candidates = []
-
-    selectors = [
-        '[data-testid*="price"]',
-        '[data-test*="price"]',
-        '[class*="price"]',
-        '[class*="Price"]',
-        '[aria-label*="Preis"]',
-    ]
-
-    for selector in selectors:
-
+        # Scroll a little so lazy-loaded content appears.
         try:
-            elements = soup.select(selector)
 
-            for element in elements[:150]:
+            page.evaluate(
+                """
+                () => {
+                    window.scrollTo(
+                        0,
+                        Math.min(
+                            document.body.scrollHeight,
+                            1800
+                        )
+                    );
+                }
+                """
+            )
 
-                if element.find_parent(
-                    ["del", "s", "strike"]
-                ):
-                    continue
-
-                text = element.get_text(
-                    " ",
-                    strip=True
-                )
-
-                if "€" not in text and "EUR" not in text:
-                    continue
-
-                price = parse_price(text)
-
-                if valid_price(price):
-                    candidates.append(price)
+            page.wait_for_timeout(2500)
 
         except Exception:
-            continue
+            pass
 
-    # Metadata
-    for element in soup.select(
-        '[itemprop="price"]'
-    ):
-        value = element.get("content")
+        # HTTP status
+        if response is not None:
 
-        if value:
-            price = parse_price(value)
+            status_code = response.status
 
-            if valid_price(price):
-                candidates.append(price)
+            print(
+                f"  HTTP status: "
+                f"{status_code}"
+            )
 
-    # JSON-LD
-    candidates.extend(
-        jsonld_prices(soup)
-    )
+            if status_code >= 400:
 
-    candidates = sorted(
-        set(round(p, 2) for p in candidates)
-    )
+                return (
+                    page,
+                    f"HTTP_{status_code}"
+                )
 
-    if not candidates:
-        return None
-
-    sensible = [
-        p for p in candidates
-        if 100 <= p <= 3000
-    ]
-
-    if sensible:
-        return sensible[0]
-
-    return candidates[0]
-
-
-def fetch_idealo(page, url):
-    try:
-        page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=45000
+        block_status = detect_block(
+            page,
+            source,
         )
 
-        page.wait_for_timeout(4000)
+        if block_status:
+
+            return (
+                page,
+                block_status
+            )
+
+        return page, "OK"
 
     except Exception as exc:
-        return None, f"HTTP_ERROR: {type(exc).__name__}"
 
-    body_text = page.locator("body").inner_text(
-        timeout=10000
-    )
+        print(
+            "  Page loading failed: "
+            f"{type(exc).__name__}: "
+            f"{exc}"
+        )
 
-    lower = body_text.lower()
-
-    if (
-        "access denied" in lower
-        or "forbidden" in lower
-        or "request blocked" in lower
-        or "captcha" in lower
-    ):
-        return None, "IDEALO_BLOCKED"
-
-    soup = BeautifulSoup(
-        page.content(),
-        "html.parser"
-    )
-
-    price = idealo_price(
-        soup,
-        page
-    )
-
-    if price is not None:
-        return price, "OK"
-
-    return None, "IDEALO_PRICE_NOT_FOUND"
+        return (
+            page,
+            f"PAGE_ERROR: {type(exc).__name__}"
+        )
 
 
-# ---------------------------------------------------------
-# BROWSER
-# ---------------------------------------------------------
+# ============================================================
+# FETCH PRICE
+# ============================================================
 
-def fetch_price(page, url, source):
+def fetch_price(browser, url, source):
+    """
+    Fetch a price from Amazon, MediaMarkt or Idealo.
+    """
 
     if not url:
-        return None, "NOT_CONFIGURED"
 
-    if source == "amazon":
-        return fetch_amazon(page, url)
+        return (
+            None,
+            "NOT_CONFIGURED"
+        )
 
-    if source == "mediamarkt":
-        return fetch_mediamarkt(page, url)
+    page = None
 
-    if source == "idealo":
-        return fetch_idealo(page, url)
+    try:
 
-    return None, "UNKNOWN_SOURCE"
+        page, load_status = load_page(
+            browser,
+            url,
+            source,
+        )
+
+        # If the page is blocked or failed, diagnose it.
+        if load_status != "OK":
+
+            diagnose_page(
+                page,
+                source,
+            )
+
+            return (
+                None,
+                load_status
+            )
+
+        # ----------------------------------------------------
+        # Extract prices
+        # ----------------------------------------------------
+
+        prices = extract_prices_from_page(
+            page,
+            source,
+        )
+
+        print(
+            f"  Candidate prices: "
+            f"{prices}"
+        )
+
+        price = choose_best_price(
+            prices,
+            source,
+        )
+
+        if price is not None:
+
+            print(
+                f"  Selected price: "
+                f"€{price:.2f}"
+            )
+
+            return (
+                price,
+                "OK"
+            )
+
+        # ----------------------------------------------------
+        # Nothing found
+        # ----------------------------------------------------
+
+        diagnose_page(
+            page,
+            source,
+        )
+
+        return (
+            None,
+            f"{source.upper()}_PRICE_NOT_FOUND"
+        )
+
+    except Exception as exc:
+
+        print(
+            f"  Extraction error: "
+            f"{type(exc).__name__}: "
+            f"{exc}"
+        )
+
+        if page is not None:
+
+            diagnose_page(
+                page,
+                source,
+            )
+
+        return (
+            None,
+            f"ERROR: {type(exc).__name__}"
+        )
+
+    finally:
+
+        if page is not None:
+
+            try:
+                page.context.close()
+
+            except Exception:
+                pass
 
 
-# ---------------------------------------------------------
-# EMAIL
-# ---------------------------------------------------------
+# ============================================================
+# PERCENTAGE CHANGE
+# ============================================================
+
+def percentage_change(old, new):
+    """Calculate percentage change."""
+
+    if old in (None, 0):
+        return None
+
+    if new is None:
+        return None
+
+    return (
+        (new - old)
+        / old
+        * 100
+    )
+
+
+# ============================================================
+# EMAIL SETTINGS
+# ============================================================
 
 def smtp_settings():
+
     return (
         os.environ.get(
             "ALERT_EMAIL_FROM",
@@ -548,71 +1011,144 @@ def smtp_settings():
     )
 
 
+# ============================================================
+# SEND EMAIL
+# ============================================================
+
 def send_email(changes, demo=False):
+    """
+    Send one combined email containing all price changes
+    from the current hourly run.
+    """
 
-    sender, recipient, password = smtp_settings()
+    sender, recipient, password = (
+        smtp_settings()
+    )
 
-    if not sender or not recipient or not password:
+    if (
+        not sender
+        or not recipient
+        or not password
+    ):
+
         raise RuntimeError(
             "Email secrets are missing. "
-            "Set ALERT_EMAIL_FROM, ALERT_EMAIL_TO "
-            "and SMTP_PASSWORD in GitHub Secrets."
+            "Set ALERT_EMAIL_FROM, "
+            "ALERT_EMAIL_TO and "
+            "SMTP_PASSWORD in GitHub Secrets."
         )
 
-    lines = [
-        "OLED Monitor Price Tracker",
-        "",
-        (
-            "DEMO TEST — no real price change was used."
-            if demo
-            else ""
-        ),
-        f"Checked: "
-        f"{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M %Z')}",
-        "",
-    ]
+    lines = []
+
+    lines.append(
+        "OLED Monitor Price Tracker"
+    )
+
+    lines.append("")
+
+    if demo:
+
+        lines.append(
+            "DEMO TEST — "
+            "these are simulated price changes."
+        )
+
+        lines.append("")
+
+    lines.append(
+        "Checked: "
+        + datetime.now()
+        .astimezone()
+        .strftime(
+            "%Y-%m-%d %H:%M %Z"
+        )
+    )
+
+    lines.append("")
 
     for change in changes:
 
-        direction = (
-            "DECREASED"
-            if change["new"] < change["old"]
-            else "INCREASED"
+        old = change["old"]
+        new = change["new"]
+
+        if new < old:
+
+            direction = "PRICE DECREASED"
+
+        elif new > old:
+
+            direction = "PRICE INCREASED"
+
+        else:
+
+            direction = "PRICE UNCHANGED"
+
+        pct = percentage_change(
+            old,
+            new,
         )
 
-        percentage = pct_change(
-            change["old"],
-            change["new"]
+        if pct is not None:
+
+            pct_text = (
+                f" ({pct:+.2f}%)"
+            )
+
+        else:
+
+            pct_text = ""
+
+        lines.append(
+            f"Monitor: "
+            f"{change['monitor']}"
         )
 
-        percentage_text = (
-            f" ({percentage:+.2f}%)"
-            if percentage is not None
-            else ""
+        lines.append(
+            f"Source: "
+            f"{change['source']}"
         )
 
-        lines += [
-            f"{change['monitor']} — {change['source']}",
-            (
-                f"{direction}: "
-                f"€{change['old']:.2f} → "
-                f"€{change['new']:.2f}"
-                f"{percentage_text}"
-            ),
-            change["url"],
-            "",
-        ]
+        lines.append(
+            f"{direction}: "
+            f"€{old:.2f} → "
+            f"€{new:.2f}"
+            f"{pct_text}"
+        )
+
+        lines.append(
+            f"URL: "
+            f"{change['url']}"
+        )
+
+        lines.append("")
+
+        lines.append(
+            "--------------------------------"
+        )
+
+        lines.append("")
 
     message = EmailMessage()
 
-    prefix = "[TEST] " if demo else ""
+    if demo:
 
-    message["Subject"] = (
-        f"{prefix}OLED price change: "
-        f"{len(changes)} change(s)"
-    )
+        subject = (
+            "[TEST] OLED monitor "
+            f"price tracker — "
+            f"{len(changes)} example changes"
+        )
+
+    else:
+
+        subject = (
+            "OLED monitor price change — "
+            f"{len(changes)} change(s)"
+        )
+
+    message["Subject"] = subject
 
     message["From"] = sender
+
     message["To"] = recipient
 
     message.set_content(
@@ -624,12 +1160,12 @@ def send_email(changes, demo=False):
     with smtplib.SMTP_SSL(
         "smtp.gmail.com",
         465,
-        context=context
+        context=context,
     ) as smtp:
 
         smtp.login(
             sender,
-            password
+            password,
         )
 
         smtp.send_message(
@@ -637,39 +1173,32 @@ def send_email(changes, demo=False):
         )
 
 
-# ---------------------------------------------------------
-# PRICE CHANGE
-# ---------------------------------------------------------
-
-def pct_change(old, new):
-
-    if old in (None, 0) or new is None:
-        return None
-
-    return (
-        (new - old) / old
-    ) * 100
-
-
-# ---------------------------------------------------------
-# DEMO EMAIL
-# ---------------------------------------------------------
+# ============================================================
+# DEMO NOTIFICATION
+# ============================================================
 
 def demo_changes(config):
+    """
+    Create fake changes for testing the email system.
+    No real prices are used.
+    """
 
     examples = [
+
         (
             "ASUS ROG Strix OLED XG32UCWMG",
             "amazon",
             799.99,
             749.99,
         ),
+
         (
             "Samsung Odyssey OLED G8 G80SD",
             "mediamarkt",
             798.87,
             829.99,
         ),
+
         (
             "LG UltraGear OLED 32GX850A-B",
             "idealo",
@@ -678,8 +1207,8 @@ def demo_changes(config):
         ),
     ]
 
-    by_name = {
-        monitor["name"]: monitor
+    monitors = {
+        monitor.get("name"): monitor
         for monitor in config.get(
             "monitors",
             []
@@ -688,37 +1217,51 @@ def demo_changes(config):
 
     rows = []
 
-    for name, source, old, new in examples:
+    for (
+        name,
+        source,
+        old,
+        new,
+    ) in examples:
 
-        monitor = by_name.get(
+        monitor = monitors.get(
             name,
             {}
         )
 
-        rows.append({
-            "monitor": name,
-            "source": source,
-            "old": old,
-            "new": new,
-            "url": monitor.get(
-                source,
-                "https://example.com/demo"
-            ),
-        })
+        rows.append(
+            {
+                "monitor": name,
+                "source": source,
+                "old": old,
+                "new": new,
+                "url": monitor.get(
+                    source,
+                    "https://example.com/demo",
+                ),
+            }
+        )
 
     return rows
 
 
-# ---------------------------------------------------------
+# ============================================================
 # README TABLE
-# ---------------------------------------------------------
+# ============================================================
 
 def build_readme_table(state):
+    """
+    Update the Current price table inside README.md.
+    """
 
     lines = [
+
         "## Current price table",
+
         "",
+
         "| Monitor | Amazon.de | MediaMarkt.de | Idealo.de | Last check |",
+
         "|---|---:|---:|---:|---|",
     ]
 
@@ -740,7 +1283,7 @@ def build_readme_table(state):
         for source in (
             "amazon",
             "mediamarkt",
-            "idealo"
+            "idealo",
         ):
 
             item = values.get(
@@ -765,11 +1308,14 @@ def build_readme_table(state):
             if price is not None:
 
                 if url:
+
                     cell = (
                         f"[€{price:.2f}]"
                         f"({url})"
                     )
+
                 else:
+
                     cell = (
                         f"€{price:.2f}"
                     )
@@ -795,25 +1341,30 @@ def build_readme_table(state):
             f"{checked} |"
         )
 
-    block = "\n".join(lines)
+    table = "\n".join(lines)
 
-    readme = (
-        README.read_text(
+    if README.exists():
+
+        readme = README.read_text(
             encoding="utf-8"
         )
-        if README.exists()
-        else ""
-    )
 
-    marker = "## Current price table"
+    else:
+
+        readme = ""
+
+    marker = (
+        "## Current price table"
+    )
 
     if marker in readme:
 
         readme = (
-            readme.split(marker)[0]
+            readme
+            .split(marker)[0]
             .rstrip()
             + "\n\n"
-            + block
+            + table
             + "\n"
         )
 
@@ -822,45 +1373,337 @@ def build_readme_table(state):
         readme = (
             readme.rstrip()
             + "\n\n"
-            + block
+            + table
             + "\n"
         )
 
     README.write_text(
         readme,
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
 
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
+# ============================================================
+# MAIN PRICE TRACKING
+# ============================================================
+
+def run_tracker(config):
+    """
+    Main tracker process.
+    """
+
+    state = load_json(
+        STATE,
+        {
+            "monitors": []
+        }
+    )
+
+    old_state_by_model = {
+        monitor["model"]: monitor
+        for monitor in state.get(
+            "monitors",
+            []
+        )
+        if "model" in monitor
+    }
+
+    changes = []
+
+    now = (
+        datetime.now(timezone.utc)
+        .astimezone()
+        .isoformat(
+            timespec="minutes"
+        )
+    )
+
+    new_state = {
+        "updated_at": now,
+        "monitors": [],
+    }
+
+    with sync_playwright() as playwright:
+
+        browser = playwright.chromium.launch(
+            headless=True
+        )
+
+        try:
+
+            for monitor in config.get(
+                "monitors",
+                []
+            ):
+
+                name = monitor.get(
+                    "name",
+                    "Unknown monitor"
+                )
+
+                model = monitor.get(
+                    "model",
+                    name
+                )
+
+                print("")
+                print(
+                    "================================================"
+                )
+
+                print(
+                    f"Checking: {name}"
+                )
+
+                print(
+                    "================================================"
+                )
+
+                old_monitor = (
+                    old_state_by_model.get(
+                        model,
+                        {}
+                    )
+                )
+
+                old_sources = {
+                    item["source"]: item
+                    for item in old_monitor.get(
+                        "sources",
+                        []
+                    )
+                    if "source" in item
+                }
+
+                source_rows = []
+
+                for source in (
+                    "amazon",
+                    "mediamarkt",
+                    "idealo",
+                ):
+
+                    url = monitor.get(
+                        source,
+                        ""
+                    )
+
+                    print("")
+                    print(
+                        f"Checking {name} | "
+                        f"{source}"
+                    )
+
+                    price, status = fetch_price(
+                        browser,
+                        url,
+                        source,
+                    )
+
+                    if price is not None:
+
+                        print(
+                            f"Result: "
+                            f"€{price:.2f}"
+                        )
+
+                    else:
+
+                        print(
+                            f"Result: N/A "
+                            f"({status})"
+                        )
+
+                    old_item = (
+                        old_sources.get(
+                            source,
+                            {}
+                        )
+                    )
+
+                    old_price = (
+                        old_item.get(
+                            "price"
+                        )
+                    )
+
+                    # ------------------------------------------------
+                    # Detect price changes
+                    # ------------------------------------------------
+
+                    if (
+                        price is not None
+                        and old_price is not None
+                        and round(
+                            price,
+                            2
+                        )
+                        != round(
+                            float(old_price),
+                            2
+                        )
+                    ):
+
+                        changes.append(
+                            {
+                                "monitor": name,
+                                "source": source,
+                                "old": float(
+                                    old_price
+                                ),
+                                "new": float(
+                                    price
+                                ),
+                                "url": url,
+                            }
+                        )
+
+                        print(
+                            "PRICE CHANGE DETECTED!"
+                        )
+
+                    source_rows.append(
+                        {
+                            "source": source,
+                            "url": url,
+                            "price": price,
+                            "status": status,
+                        }
+                    )
+
+                new_state[
+                    "monitors"
+                ].append(
+                    {
+                        "name": name,
+                        "model": model,
+                        "last_checked": now,
+                        "sources": source_rows,
+                    }
+                )
+
+        finally:
+
+            browser.close()
+
+    # --------------------------------------------------------
+    # Save state
+    # --------------------------------------------------------
+
+    save_json(
+        STATE,
+        new_state
+    )
+
+    # --------------------------------------------------------
+    # Update README
+    # --------------------------------------------------------
+
+    build_readme_table(
+        new_state
+    )
+
+    # --------------------------------------------------------
+    # Send ONE combined email
+    # --------------------------------------------------------
+
+    if changes:
+
+        print("")
+        print(
+            f"Sending email for "
+            f"{len(changes)} price change(s)..."
+        )
+
+        send_email(
+            changes
+        )
+
+        print(
+            "Price-change email sent."
+        )
+
+    else:
+
+        print("")
+        print(
+            "No price changes."
+        )
+
+        print(
+            "No email sent."
+        )
+
+    print("")
+    print(
+        f"Checked "
+        f"{len(config.get('monitors', []))} "
+        f"monitors."
+    )
+
+    print(
+        f"Price changes: "
+        f"{len(changes)}"
+    )
+
+
+# ============================================================
+# PROGRAM ENTRY POINT
+# ============================================================
 
 def main():
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Automatic OLED monitor "
+            "price tracker"
+        )
+    )
 
     parser.add_argument(
         "--demo-notification",
         action="store_true",
         help=(
             "Send a clearly labelled "
-            "test email without checking prices."
+            "test email without checking "
+            "real prices."
         ),
     )
 
     args = parser.parse_args()
 
+    # --------------------------------------------------------
+    # Load monitor configuration
+    # --------------------------------------------------------
+
     config = load_json(
         CONFIG,
-        {"monitors": []}
+        {
+            "monitors": []
+        }
     )
 
-    # -----------------------------------------------------
-    # DEMO EMAIL
-    # -----------------------------------------------------
+    monitors = config.get(
+        "monitors",
+        []
+    )
+
+    if not monitors:
+
+        raise RuntimeError(
+            "No monitors found in "
+            "config/monitors.json"
+        )
+
+    # --------------------------------------------------------
+    # Demo email
+    # --------------------------------------------------------
 
     if args.demo_notification:
+
+        print(
+            "Sending demo notification..."
+        )
 
         changes = demo_changes(
             config
@@ -877,226 +1720,12 @@ def main():
 
         return
 
-    # -----------------------------------------------------
-    # LOAD OLD STATE
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Normal tracker
+    # --------------------------------------------------------
 
-    state = load_json(
-        STATE,
-        {"monitors": []}
-    )
-
-    state_by_model = {
-        monitor["model"]: monitor
-        for monitor in state.get(
-            "monitors",
-            []
-        )
-    }
-
-    changes = []
-
-    now = datetime.now(
-        timezone.utc
-    ).astimezone().isoformat(
-        timespec="minutes"
-    )
-
-    new_state = {
-        "updated_at": now,
-        "monitors": [],
-    }
-
-    # -----------------------------------------------------
-    # BROWSER
-    # -----------------------------------------------------
-
-    with sync_playwright() as playwright:
-
-        browser = playwright.chromium.launch(
-            headless=True
-        )
-
-        context = browser.new_context(
-            locale="de-DE",
-            timezone_id="Europe/Berlin",
-            viewport={
-                "width": 1440,
-                "height": 900,
-            },
-            extra_http_headers=HEADERS,
-        )
-
-        page = context.new_page()
-
-        # -------------------------------------------------
-        # MONITORS
-        # -------------------------------------------------
-
-        for monitor in config.get(
-            "monitors",
-            []
-        ):
-
-            old_monitor = state_by_model.get(
-                monitor["model"],
-                {}
-            )
-
-            old_sources = {
-                source["source"]: source
-                for source in old_monitor.get(
-                    "sources",
-                    []
-                )
-            }
-
-            source_rows = []
-
-            for source in (
-                "amazon",
-                "mediamarkt",
-                "idealo"
-            ):
-
-                url = monitor.get(
-                    source,
-                    ""
-                )
-
-                print(
-                    f"Checking "
-                    f"{monitor['name']} "
-                    f"| {source}"
-                )
-
-                try:
-
-                    price, status = fetch_price(
-                        page,
-                        url,
-                        source
-                    )
-
-                except PlaywrightTimeoutError:
-
-                    price = None
-                    status = (
-                        "BROWSER_TIMEOUT"
-                    )
-
-                except Exception as exc:
-
-                    price = None
-                    status = (
-                        f"ERROR: "
-                        f"{type(exc).__name__}"
-                    )
-
-                old = old_sources.get(
-                    source,
-                    {}
-                ).get(
-                    "price"
-                )
-
-                if (
-                    price is not None
-                    and old is not None
-                    and round(price, 2)
-                    != round(float(old), 2)
-                ):
-
-                    changes.append({
-                        "monitor": monitor["name"],
-                        "source": source,
-                        "old": float(old),
-                        "new": float(price),
-                        "url": url,
-                    })
-
-                source_rows.append({
-                    "source": source,
-                    "url": url,
-                    "price": price,
-                    "status": status,
-                })
-
-                print(
-                    f"  Result: "
-                    f"{price if price is not None else 'N/A'} "
-                    f"({status})"
-                )
-
-            if price is None:
-    try:
-        title = page.title()
-        body_sample = page.locator("body").inner_text(
-            timeout=5000
-        )[:1500]
-
-        print(f"  Page title: {title}")
-        print("  Page text sample:")
-        print(body_sample)
-    except Exception as exc:
-        print(
-            f"  Could not collect diagnostic page text: "
-            f"{type(exc).__name__}"
-        )
-
-            new_state["monitors"].append({
-                "name": monitor["name"],
-                "model": monitor["model"],
-                "last_checked": now,
-                "sources": source_rows,
-            })
-
-        browser.close()
-
-    # -----------------------------------------------------
-    # SAVE
-    # -----------------------------------------------------
-
-    save_json(
-        STATE,
-        new_state
-    )
-
-    build_readme_table(
-        new_state
-    )
-
-    # -----------------------------------------------------
-    # EMAIL ONLY IF PRICE CHANGED
-    # -----------------------------------------------------
-
-    if changes:
-
-        send_email(
-            changes
-        )
-
-        print(
-            f"Email sent for "
-            f"{len(changes)} price change(s)."
-        )
-
-    else:
-
-        print(
-            "No price changes. "
-            "No email sent."
-        )
-
-    print(
-        f"Checked "
-        f"{len(config.get('monitors', []))} "
-        f"monitors."
-    )
-
-    print(
-        f"Price changes: "
-        f"{len(changes)}"
+    run_tracker(
+        config
     )
 
 

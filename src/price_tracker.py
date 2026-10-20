@@ -1,1733 +1,720 @@
-import argparse
 import json
 import os
 import re
 import smtplib
 import ssl
+import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote_plus
 
+import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
 
 # ============================================================
 # PATHS
 # ============================================================
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parent.parent
 
-CONFIG = ROOT / "config" / "monitors.json"
-STATE = ROOT / "data" / "state.json"
-README = ROOT / "README.md"
+CONFIG_FILE = ROOT_DIR / "config" / "monitors.json"
+STATE_FILE = ROOT_DIR / "data" / "state.json"
+README_FILE = ROOT_DIR / "README.md"
 
 
 # ============================================================
-# BROWSER SETTINGS
+# SETTINGS
 # ============================================================
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/142.0.0.0 Safari/537.36"
-)
+REQUEST_TIMEOUT = 20
 
-BROWSER_HEADERS = {
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
 }
 
-
-# ============================================================
-# FILE HELPERS
-# ============================================================
-
-def load_json(path, default):
-    """Load JSON safely."""
-    if not path.exists():
-        return default
-
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
-def save_json(path, data):
-    """Save JSON with readable formatting."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    path.write_text(
-        json.dumps(
-            data,
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+# Search engines used as public search/index sources.
+SEARCH_ENGINES = [
+    "https://www.google.com/search?q={query}&hl=de&gl=de",
+    "https://www.bing.com/search?q={query}&setlang=de-DE",
+    "https://html.duckduckgo.com/html/?q={query}",
+]
 
 
 # ============================================================
 # PRICE PARSING
 # ============================================================
 
-def parse_price(value):
+def parse_price(text):
     """
-    Convert German/international price strings to float.
+    Extract a Euro price from arbitrary text.
 
     Examples:
-        799,99 €       -> 799.99
-        1.299,99 €     -> 1299.99
-        799.99 €       -> 799.99
-        EUR 799.99     -> 799.99
-        799.99         -> 799.99
-    """
-
-    if value is None:
-        return None
-
-    text = str(value)
-
-    text = (
-        text.replace("\xa0", " ")
-        .replace("\u202f", " ")
-        .strip()
-    )
-
-    # --------------------------------------------------------
-    # German format
-    # 799,99
-    # 1.299,99
-    # --------------------------------------------------------
-
-    match = re.search(
-        r"(\d{1,5}(?:[.\s]\d{3})*,\d{2})",
-        text,
-    )
-
-    if match:
-        raw = match.group(1)
-
-        raw = (
-            raw.replace(".", "")
-            .replace(" ", "")
-            .replace(",", ".")
-        )
-
-        try:
-            return float(raw)
-        except ValueError:
-            pass
-
-    # --------------------------------------------------------
-    # International format
-    # 799.99
-    # 1,299.99
-    # --------------------------------------------------------
-
-    match = re.search(
-        r"(\d{1,5}(?:,\d{3})*\.\d{2})",
-        text,
-    )
-
-    if match:
-        raw = match.group(1)
-
-        raw = raw.replace(",", "")
-
-        try:
-            return float(raw)
-        except ValueError:
-            pass
-
-    # --------------------------------------------------------
-    # Plain decimal
-    # --------------------------------------------------------
-
-    match = re.fullmatch(
-        r"\s*(\d{2,5}(?:[.,]\d{1,2})?)\s*",
-        text,
-    )
-
-    if match:
-        raw = match.group(1)
-
-        try:
-            if "," in raw and "." not in raw:
-                return float(raw.replace(",", "."))
-
-            return float(raw.replace(",", ""))
-        except ValueError:
-            pass
-
-    # --------------------------------------------------------
-    # EUR / € before number
-    # --------------------------------------------------------
-
-    match = re.search(
-        r"(?:€|EUR)\s*(\d{2,5}(?:[.,]\d{1,2})?)",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    if match:
-        raw = match.group(1)
-
-        try:
-            return float(raw.replace(",", "."))
-        except ValueError:
-            pass
-
-    return None
-
-
-def valid_price(price):
-    """
-    Prevent obvious false positives.
-
-    Gaming monitors in this tracker should normally fall
-    somewhere between €50 and €5000.
-    """
-
-    return (
-        price is not None
-        and 50 <= price <= 5000
-    )
-
-
-# ============================================================
-# PRICE EXTRACTION FROM TEXT
-# ============================================================
-
-def extract_prices_from_text(text):
-    """
-    Extract possible prices from page text.
-
-    Returns a list of valid prices.
+        1.299,00 €
+        1299,00€
+        €1,299.00
+        999 €
     """
 
     if not text:
-        return []
-
-    text = (
-        text.replace("\xa0", " ")
-        .replace("\u202f", " ")
-    )
-
-    candidates = []
-
-    # German prices:
-    # 799,99 €
-    # 1.299,99 €
-    candidates.extend(
-        re.findall(
-            r"\b\d{1,5}(?:[.\s]\d{3})*,\d{2}\s*€",
-            text,
-            flags=re.IGNORECASE,
-        )
-    )
-
-    # International prices:
-    # 799.99 €
-    # 1,299.99 €
-    candidates.extend(
-        re.findall(
-            r"\b\d{1,5}(?:,\d{3})*\.\d{2}\s*€",
-            text,
-            flags=re.IGNORECASE,
-        )
-    )
-
-    # EUR format
-    candidates.extend(
-        re.findall(
-            r"(?:€|EUR)\s*\d{2,5}(?:[.,]\d{2})?",
-            text,
-            flags=re.IGNORECASE,
-        )
-    )
-
-    prices = []
-
-    for candidate in candidates:
-        price = parse_price(candidate)
-
-        if valid_price(price):
-            prices.append(price)
-
-    return prices
-
-
-# ============================================================
-# JSON-LD PRICE EXTRACTION
-# ============================================================
-
-def extract_jsonld_prices(soup):
-    """
-    Extract product prices from JSON-LD structured data.
-    """
-
-    prices = []
-
-    scripts = soup.select(
-        'script[type="application/ld+json"]'
-    )
-
-    for script in scripts:
-        try:
-            raw = script.string or script.get_text()
-
-            data = json.loads(raw)
-
-        except Exception:
-            continue
-
-        stack = []
-
-        if isinstance(data, list):
-            stack.extend(data)
-        else:
-            stack.append(data)
-
-        while stack:
-
-            item = stack.pop()
-
-            if isinstance(item, dict):
-
-                # Direct price
-                if "price" in item:
-
-                    price = parse_price(
-                        item.get("price")
-                    )
-
-                    if valid_price(price):
-                        prices.append(price)
-
-                # Offers
-                if "offers" in item:
-
-                    offers = item["offers"]
-
-                    if isinstance(offers, list):
-                        stack.extend(offers)
-
-                    elif isinstance(offers, dict):
-                        stack.append(offers)
-
-                # Nested dictionaries/lists
-                for value in item.values():
-
-                    if isinstance(value, dict):
-                        stack.append(value)
-
-                    elif isinstance(value, list):
-                        stack.extend(value)
-
-            elif isinstance(item, list):
-
-                stack.extend(item)
-
-    return prices
-
-
-# ============================================================
-# PAGE PRICE EXTRACTION
-# ============================================================
-
-def extract_prices_from_page(page, source):
-    """
-    Extract possible prices from the rendered browser page.
-
-    We use several methods because Amazon, MediaMarkt and
-    Idealo do not expose their prices in exactly the same way.
-    """
-
-    prices = []
-
-    # --------------------------------------------------------
-    # 1. Rendered page text
-    # --------------------------------------------------------
-
-    try:
-        body_text = page.locator("body").inner_text(
-            timeout=10000
-        )
-
-        prices.extend(
-            extract_prices_from_text(body_text)
-        )
-
-    except Exception:
-        body_text = ""
-
-    # --------------------------------------------------------
-    # 2. HTML / JSON-LD
-    # --------------------------------------------------------
-
-    try:
-        html = page.content()
-
-        soup = BeautifulSoup(
-            html,
-            "html.parser",
-        )
-
-        prices.extend(
-            extract_jsonld_prices(soup)
-        )
-
-        # itemprop price
-        for tag in soup.select(
-            '[itemprop="price"]'
-        ):
-
-            if tag.get("content"):
-
-                price = parse_price(
-                    tag.get("content")
-                )
-
-                if valid_price(price):
-                    prices.append(price)
-
-            text = tag.get_text(
-                " ",
-                strip=True,
-            )
-
-            price = parse_price(text)
-
-            if valid_price(price):
-                prices.append(price)
-
-    except Exception:
-        pass
-
-    # --------------------------------------------------------
-    # 3. Source-specific selectors
-    # --------------------------------------------------------
-
-    selectors = []
-
-    if source == "amazon":
-
-        selectors = [
-            "#corePriceDisplay_desktop_feature_div "
-            ".a-price:not(.a-text-price) .a-offscreen",
-
-            "#corePrice_feature_div "
-            ".a-price:not(.a-text-price) .a-offscreen",
-
-            "#apex_desktop "
-            ".a-price:not(.a-text-price) .a-offscreen",
-
-            "#price_inside_buybox .a-offscreen",
-
-            "#priceblock_ourprice",
-
-            "#priceblock_dealprice",
-
-            "[data-a-color='price'] .a-offscreen",
-
-            ".a-price .a-offscreen",
-        ]
-
-    elif source == "mediamarkt":
-
-        selectors = [
-            '[data-test="mms-price"]',
-
-            '[data-testid="price"]',
-
-            '[data-test*="price"]',
-
-            '[class*="price"]',
-
-            '[class*="Price"]',
-
-            '[class*="priceContainer"]',
-
-            '[class*="PriceContainer"]',
-        ]
-
-    elif source == "idealo":
-
-        selectors = [
-            '[data-testid*="price"]',
-
-            '[data-test*="price"]',
-
-            '[class*="price"]',
-
-            '[class*="Price"]',
-
-            '[class*="offer"]',
-
-            '[class*="Offer"]',
-        ]
-
-    # --------------------------------------------------------
-    # Read source-specific selectors
-    # --------------------------------------------------------
-
-    for selector in selectors:
-
-        try:
-
-            elements = page.locator(selector)
-
-            count = min(
-                elements.count(),
-                100,
-            )
-
-            for index in range(count):
-
-                try:
-
-                    text = elements.nth(
-                        index
-                    ).inner_text(
-                        timeout=2000
-                    )
-
-                    prices.extend(
-                        extract_prices_from_text(
-                            text
-                        )
-                    )
-
-                except Exception:
-                    continue
-
-        except Exception:
-            continue
-
-    # --------------------------------------------------------
-    # Remove duplicates
-    # --------------------------------------------------------
-
-    unique_prices = []
-
-    for price in prices:
-
-        rounded = round(price, 2)
-
-        if rounded not in unique_prices:
-            unique_prices.append(rounded)
-
-    return unique_prices
-
-
-# ============================================================
-# SOURCE-SPECIFIC PRICE SELECTION
-# ============================================================
-
-def choose_best_price(prices, source):
-    """
-    Choose the most likely current product price.
-
-    Idealo:
-        Usually "ab €XXX" = lowest current offer.
-
-    MediaMarkt:
-        Usually the product page has one primary price.
-
-    Amazon:
-        Prefer the lowest valid price returned by the
-        current-price selectors.
-    """
-
-    if not prices:
         return None
 
-    prices = [
-        p
-        for p in prices
-        if valid_price(p)
+    patterns = [
+        r"€\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
+        r"([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)\s*€",
+        r"EUR\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)",
     ]
 
-    if not prices:
-        return None
+    for pattern in patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
 
-    # --------------------------------------------------------
-    # Idealo
-    # --------------------------------------------------------
+        for value in matches:
+            try:
+                value = value.replace(" ", "")
 
-    if source == "idealo":
-        return min(prices)
+                # German format: 1.299,99
+                if "," in value and "." in value:
+                    value = value.replace(".", "").replace(",", ".")
 
-    # --------------------------------------------------------
-    # MediaMarkt
-    # --------------------------------------------------------
+                # German decimal format: 1299,99
+                elif "," in value:
+                    value = value.replace(",", ".")
 
-    if source == "mediamarkt":
+                # Avoid interpreting things like years/model numbers
+                price = float(value)
 
-        # Product prices should normally be in this range.
-        # Selecting the minimum also avoids accidentally
-        # picking an old/list price.
-        return min(prices)
+                if 50 <= price <= 10000:
+                    return round(price, 2)
 
-    # --------------------------------------------------------
-    # Amazon
-    # --------------------------------------------------------
-
-    if source == "amazon":
-        return min(prices)
-
-    return min(prices)
-
-
-# ============================================================
-# PAGE DIAGNOSTICS
-# ============================================================
-
-def diagnose_page(page, source):
-    """
-    Print useful information when price extraction fails.
-
-    This is intentionally printed into GitHub Actions logs.
-    """
-
-    print("")
-    print("  ---------- DIAGNOSTIC ----------")
-
-    try:
-        title = page.title()
-
-        print(f"  Page title: {title}")
-
-    except Exception as exc:
-
-        print(
-            "  Page title unavailable: "
-            f"{type(exc).__name__}"
-        )
-
-    try:
-        url = page.url
-
-        print(f"  Final URL: {url}")
-
-    except Exception:
-        pass
-
-    try:
-
-        body_text = page.locator(
-            "body"
-        ).inner_text(
-            timeout=5000
-        )
-
-        body_text = body_text.strip()
-
-        print("  Page text sample:")
-
-        if body_text:
-
-            print(
-                body_text[:2500]
-            )
-
-        else:
-
-            print(
-                "  <EMPTY PAGE BODY>"
-            )
-
-    except Exception as exc:
-
-        print(
-            "  Could not collect page text: "
-            f"{type(exc).__name__}"
-        )
-
-    print(
-        f"  Source: {source}"
-    )
-
-    print(
-        "  --------------------------------"
-    )
-
-
-# ============================================================
-# BOT / BLOCK DETECTION
-# ============================================================
-
-def detect_block(page, source):
-    """
-    Detect common block/challenge pages.
-    """
-
-    try:
-
-        title = page.title().lower()
-
-    except Exception:
-
-        title = ""
-
-    try:
-
-        text = page.locator(
-            "body"
-        ).inner_text(
-            timeout=5000
-        ).lower()
-
-    except Exception:
-
-        text = ""
-
-    combined = (
-        title
-        + "\n"
-        + text[:10000]
-    )
-
-    # Amazon
-    if source == "amazon":
-
-        amazon_markers = [
-            "robot check",
-            "enter the characters you see",
-            "type the characters",
-            "captcha",
-            "sorry, we just need to make sure",
-            "automated access",
-        ]
-
-        for marker in amazon_markers:
-
-            if marker in combined:
-
-                return (
-                    "AMAZON_BOT_CHECK"
-                )
-
-    # General blocking
-    block_markers = [
-        "access denied",
-        "request blocked",
-        "forbidden",
-        "too many requests",
-        "unusual traffic",
-        "security check",
-        "checking your browser",
-    ]
-
-    for marker in block_markers:
-
-        if marker in combined:
-
-            return (
-                "SITE_BLOCKED"
-            )
+            except ValueError:
+                continue
 
     return None
 
 
 # ============================================================
-# BROWSER PAGE LOADING
+# SEARCH
 # ============================================================
 
-def load_page(browser, url, source):
+def build_search_query(model, retailer):
     """
-    Open a page using Playwright.
+    Search for the exact monitor model on a particular retailer.
+    """
+
+    retailer_domains = {
+        "amazon": "amazon.de",
+        "mediamarkt": "mediamarkt.de",
+        "idealo": "idealo.de",
+    }
+
+    domain = retailer_domains[retailer]
+
+    return (
+        f'"{model}" '
+        f'site:{domain} '
+        f'(preis OR kaufen OR €)'
+    )
+
+
+def get_search_page(url):
+    """
+    Download a public search result page.
+    """
+
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        response.raise_for_status()
+
+        return response.text
+
+    except Exception as exc:
+        print(f"SEARCH_ERROR: {type(exc).__name__}: {exc}")
+        return None
+
+
+def extract_search_results(html):
+    """
+    Extract readable search result blocks from a search page.
+    """
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    results = []
+
+    # Google
+    for result in soup.select("div.MjjYud"):
+        text = result.get_text(" ", strip=True)
+
+        if text:
+            results.append(text)
+
+    # Bing
+    for result in soup.select("li.b_algo"):
+        text = result.get_text(" ", strip=True)
+
+        if text:
+            results.append(text)
+
+    # DuckDuckGo
+    for result in soup.select(".result"):
+        text = result.get_text(" ", strip=True)
+
+        if text:
+            results.append(text)
+
+    # Generic fallback
+    if not results:
+        body = soup.get_text(" ", strip=True)
+
+        if body:
+            results.append(body)
+
+    return results
+
+
+def search_for_price(model, retailer):
+    """
+    Search public search-engine results for the monitor model
+    and extract a plausible current price.
 
     Returns:
-        page, status
+        {
+            "price": float | None,
+            "source": str,
+            "snippet": str
+        }
     """
 
-    context = browser.new_context(
-        user_agent=USER_AGENT,
-        locale="de-DE",
-        timezone_id="Europe/Berlin",
-        extra_http_headers=BROWSER_HEADERS,
-        viewport={
-            "width": 1440,
-            "height": 1000,
+    query = build_search_query(model, retailer)
+    encoded_query = quote_plus(query)
+
+    print()
+    print("=" * 70)
+    print(f"Searching: {model}")
+    print(f"Retailer:  {retailer}")
+    print(f"Query:     {query}")
+    print("=" * 70)
+
+    for engine_index, template in enumerate(SEARCH_ENGINES, start=1):
+
+        url = template.format(query=encoded_query)
+
+        print(f"Search engine #{engine_index}")
+
+        html = get_search_page(url)
+
+        if not html:
+            continue
+
+        results = extract_search_results(html)
+
+        print(f"Found {len(results)} result blocks.")
+
+        for result in results:
+
+            # We want the model name to appear somewhere in the result.
+            model_words = model.lower().split()
+
+            result_lower = result.lower()
+
+            matching_words = sum(
+                1 for word in model_words
+                if len(word) >= 3 and word in result_lower
+            )
+
+            # Require a reasonable amount of model-name matching.
+            if matching_words < max(2, len(model_words) // 2):
+                continue
+
+            price = parse_price(result)
+
+            if price is None:
+                continue
+
+            print(f"PRICE FOUND: €{price:.2f}")
+            print(f"Snippet: {result[:500]}")
+
+            return {
+                "price": price,
+                "source": retailer,
+                "snippet": result[:1000],
+            }
+
+        time.sleep(2)
+
+    print("PRICE_NOT_FOUND")
+
+    return {
+        "price": None,
+        "source": retailer,
+        "snippet": "",
+    }
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+def load_json(path, default):
+    try:
+        if not path.exists():
+            return default
+
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+
+    except Exception as exc:
+        print(f"Could not read {path}: {exc}")
+        return default
+
+
+def save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(
+            data,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+def load_state():
+    return load_json(
+        STATE_FILE,
+        {
+            "last_updated": None,
+            "monitors": {},
         },
-        java_script_enabled=True,
     )
 
-    page = context.new_page()
+
+# ============================================================
+# PRICE COMPARISON
+# ============================================================
+
+def classify_change(old_price, new_price):
+    if old_price is None or new_price is None:
+        return "UNKNOWN"
+
+    if new_price < old_price:
+        return "DECREASE"
+
+    if new_price > old_price:
+        return "INCREASE"
+
+    return "UNCHANGED"
+
+
+# ============================================================
+# README UPDATE
+# ============================================================
+
+def update_readme(monitors):
+    """
+    Replace the automatically generated price table in README.md.
+    """
+
+    if not README_FILE.exists():
+        return
 
     try:
+        readme = README_FILE.read_text(encoding="utf-8")
 
-        print(
-            f"  Opening: {url}"
+        start_marker = "<!-- PRICE_TABLE_START -->"
+        end_marker = "<!-- PRICE_TABLE_END -->"
+
+        if start_marker not in readme or end_marker not in readme:
+            print("README price table markers not found.")
+            return
+
+        rows = []
+
+        rows.append("| Monitor | Amazon.de | MediaMarkt.de | Idealo.de |")
+        rows.append("|---|---:|---:|---:|")
+
+        for monitor_name, data in monitors.items():
+
+            prices = data.get("prices", {})
+
+            amazon = prices.get("amazon")
+            mediamarkt = prices.get("mediamarkt")
+            idealo = prices.get("idealo")
+
+            def fmt(value):
+                if value is None:
+                    return "N/A"
+
+                return f"€{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+            rows.append(
+                f"| {monitor_name} | "
+                f"{fmt(amazon)} | "
+                f"{fmt(mediamarkt)} | "
+                f"{fmt(idealo)} |"
+            )
+
+        table = "\n".join(rows)
+
+        before = readme.split(start_marker)[0]
+        after = readme.split(end_marker)[1]
+
+        new_readme = (
+            before
+            + start_marker
+            + "\n"
+            + table
+            + "\n"
+            + end_marker
+            + after
         )
 
-        response = page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=60000,
+        README_FILE.write_text(
+            new_readme,
+            encoding="utf-8",
         )
 
-        # Give dynamic pages time to render.
-        page.wait_for_timeout(5000)
-
-        # Try network-idle, but don't fail if the site
-        # continuously loads resources.
-        try:
-
-            page.wait_for_load_state(
-                "networkidle",
-                timeout=15000,
-            )
-
-        except Exception:
-            pass
-
-        # Scroll a little so lazy-loaded content appears.
-        try:
-
-            page.evaluate(
-                """
-                () => {
-                    window.scrollTo(
-                        0,
-                        Math.min(
-                            document.body.scrollHeight,
-                            1800
-                        )
-                    );
-                }
-                """
-            )
-
-            page.wait_for_timeout(2500)
-
-        except Exception:
-            pass
-
-        # HTTP status
-        if response is not None:
-
-            status_code = response.status
-
-            print(
-                f"  HTTP status: "
-                f"{status_code}"
-            )
-
-            if status_code >= 400:
-
-                return (
-                    page,
-                    f"HTTP_{status_code}"
-                )
-
-        block_status = detect_block(
-            page,
-            source,
-        )
-
-        if block_status:
-
-            return (
-                page,
-                block_status
-            )
-
-        return page, "OK"
+        print("README updated.")
 
     except Exception as exc:
-
-        print(
-            "  Page loading failed: "
-            f"{type(exc).__name__}: "
-            f"{exc}"
-        )
-
-        return (
-            page,
-            f"PAGE_ERROR: {type(exc).__name__}"
-        )
+        print(f"README update failed: {exc}")
 
 
 # ============================================================
-# FETCH PRICE
+# EMAIL
 # ============================================================
 
-def fetch_price(browser, url, source):
+def send_email(changes):
     """
-    Fetch a price from Amazon, MediaMarkt or Idealo.
+    Send ONE combined email containing all price changes
+    detected during this run.
     """
 
-    if not url:
+    sender = os.getenv("ALERT_EMAIL_FROM")
+    recipient = os.getenv("ALERT_EMAIL_TO")
+    password = os.getenv("SMTP_PASSWORD")
 
-        return (
-            None,
-            "NOT_CONFIGURED"
-        )
+    if not sender or not recipient or not password:
+        print("Email secrets are missing.")
+        print("Skipping email.")
+        return
 
-    page = None
+    if not changes:
+        print("No changes. No email will be sent.")
+        return
 
-    try:
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d %H:%M UTC")
 
-        page, load_status = load_page(
-            browser,
-            url,
-            source,
-        )
+    subject = f"OLED Monitor Price Alert — {len(changes)} change(s)"
 
-        # If the page is blocked or failed, diagnose it.
-        if load_status != "OK":
-
-            diagnose_page(
-                page,
-                source,
-            )
-
-            return (
-                None,
-                load_status
-            )
-
-        # ----------------------------------------------------
-        # Extract prices
-        # ----------------------------------------------------
-
-        prices = extract_prices_from_page(
-            page,
-            source,
-        )
-
-        print(
-            f"  Candidate prices: "
-            f"{prices}"
-        )
-
-        price = choose_best_price(
-            prices,
-            source,
-        )
-
-        if price is not None:
-
-            print(
-                f"  Selected price: "
-                f"€{price:.2f}"
-            )
-
-            return (
-                price,
-                "OK"
-            )
-
-        # ----------------------------------------------------
-        # Nothing found
-        # ----------------------------------------------------
-
-        diagnose_page(
-            page,
-            source,
-        )
-
-        return (
-            None,
-            f"{source.upper()}_PRICE_NOT_FOUND"
-        )
-
-    except Exception as exc:
-
-        print(
-            f"  Extraction error: "
-            f"{type(exc).__name__}: "
-            f"{exc}"
-        )
-
-        if page is not None:
-
-            diagnose_page(
-                page,
-                source,
-            )
-
-        return (
-            None,
-            f"ERROR: {type(exc).__name__}"
-        )
-
-    finally:
-
-        if page is not None:
-
-            try:
-                page.context.close()
-
-            except Exception:
-                pass
-
-
-# ============================================================
-# PERCENTAGE CHANGE
-# ============================================================
-
-def percentage_change(old, new):
-    """Calculate percentage change."""
-
-    if old in (None, 0):
-        return None
-
-    if new is None:
-        return None
-
-    return (
-        (new - old)
-        / old
-        * 100
-    )
-
-
-# ============================================================
-# EMAIL SETTINGS
-# ============================================================
-
-def smtp_settings():
-
-    return (
-        os.environ.get(
-            "ALERT_EMAIL_FROM",
-            ""
-        ).strip(),
-
-        os.environ.get(
-            "ALERT_EMAIL_TO",
-            ""
-        ).strip(),
-
-        os.environ.get(
-            "SMTP_PASSWORD",
-            ""
-        ).strip(),
-    )
-
-
-# ============================================================
-# SEND EMAIL
-# ============================================================
-
-def send_email(changes, demo=False):
-    """
-    Send one combined email containing all price changes
-    from the current hourly run.
-    """
-
-    sender, recipient, password = (
-        smtp_settings()
-    )
-
-    if (
-        not sender
-        or not recipient
-        or not password
-    ):
-
-        raise RuntimeError(
-            "Email secrets are missing. "
-            "Set ALERT_EMAIL_FROM, "
-            "ALERT_EMAIL_TO and "
-            "SMTP_PASSWORD in GitHub Secrets."
-        )
-
-    lines = []
-
-    lines.append(
-        "OLED Monitor Price Tracker"
-    )
-
-    lines.append("")
-
-    if demo:
-
-        lines.append(
-            "DEMO TEST — "
-            "these are simulated price changes."
-        )
-
-        lines.append("")
-
-    lines.append(
-        "Checked: "
-        + datetime.now()
-        .astimezone()
-        .strftime(
-            "%Y-%m-%d %H:%M %Z"
-        )
-    )
-
-    lines.append("")
+    body_lines = [
+        "OLED Gaming Monitor Price Tracker",
+        "",
+        f"Checked: {timestamp}",
+        "",
+        "PRICE CHANGES",
+        "==============",
+        "",
+    ]
 
     for change in changes:
 
-        old = change["old"]
-        new = change["new"]
+        old_price = change["old_price"]
+        new_price = change["new_price"]
 
-        if new < old:
+        direction = change["direction"]
 
-            direction = "PRICE DECREASED"
-
-        elif new > old:
-
-            direction = "PRICE INCREASED"
-
+        if direction == "DECREASE":
+            symbol = "↓"
+        elif direction == "INCREASE":
+            symbol = "↑"
         else:
+            symbol = "→"
 
-            direction = "PRICE UNCHANGED"
-
-        pct = percentage_change(
-            old,
-            new,
+        body_lines.extend(
+            [
+                f"{symbol} {change['monitor']}",
+                f"   Source: {change['source']}",
+                f"   Old price: €{old_price:.2f}",
+                f"   New price: €{new_price:.2f}",
+                f"   Change: €{new_price - old_price:+.2f}",
+                "",
+            ]
         )
 
-        if pct is not None:
-
-            pct_text = (
-                f" ({pct:+.2f}%)"
-            )
-
-        else:
-
-            pct_text = ""
-
-        lines.append(
-            f"Monitor: "
-            f"{change['monitor']}"
-        )
-
-        lines.append(
-            f"Source: "
-            f"{change['source']}"
-        )
-
-        lines.append(
-            f"{direction}: "
-            f"€{old:.2f} → "
-            f"€{new:.2f}"
-            f"{pct_text}"
-        )
-
-        lines.append(
-            f"URL: "
-            f"{change['url']}"
-        )
-
-        lines.append("")
-
-        lines.append(
-            "--------------------------------"
-        )
-
-        lines.append("")
+    body_lines.extend(
+        [
+            "The tracker checks prices automatically every hour.",
+            "",
+            "GitHub repository:",
+            "https://github.com/abdulazeemsikander/oled-monitor-price-tracker",
+        ]
+    )
 
     message = EmailMessage()
 
-    if demo:
-
-        subject = (
-            "[TEST] OLED monitor "
-            f"price tracker — "
-            f"{len(changes)} example changes"
-        )
-
-    else:
-
-        subject = (
-            "OLED monitor price change — "
-            f"{len(changes)} change(s)"
-        )
-
+    message["From"] = sender
+    message["To"] = recipient
     message["Subject"] = subject
 
-    message["From"] = sender
+    message.set_content("\n".join(body_lines))
 
+    try:
+        context = ssl.create_default_context()
+
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com",
+            465,
+            context=context,
+        ) as server:
+
+            server.login(
+                sender,
+                password,
+            )
+
+            server.send_message(message)
+
+        print("Email sent successfully.")
+
+    except Exception as exc:
+        print(f"EMAIL_ERROR: {type(exc).__name__}: {exc}")
+
+
+# ============================================================
+# DEMO EMAIL
+# ============================================================
+
+def send_demo_email():
+    """
+    Sends a clearly labelled test email.
+
+    This is separate from real price changes.
+    """
+
+    sender = os.getenv("ALERT_EMAIL_FROM")
+    recipient = os.getenv("ALERT_EMAIL_TO")
+    password = os.getenv("SMTP_PASSWORD")
+
+    if not sender or not recipient or not password:
+        print("Email secrets missing. Demo email skipped.")
+        return
+
+    message = EmailMessage()
+
+    message["From"] = sender
     message["To"] = recipient
+    message["Subject"] = "OLED Monitor Tracker — TEST EMAIL"
 
     message.set_content(
-        "\n".join(lines)
+        """
+OLED Gaming Monitor Price Tracker
+
+This is a TEST notification.
+
+Your GitHub Actions workflow is able to send email successfully.
+
+Example changes:
+
+↓ ASUS ROG Strix OLED XG32UCWMG
+   Amazon.de
+   €1,499.00 → €1,399.00
+
+↑ Samsung Odyssey OLED G8 G80SD
+   MediaMarkt.de
+   €899.00 → €949.00
+
+↓ LG UltraGear OLED 32GX850A-B
+   Idealo.de
+   €999.00 → €949.00
+
+This email does NOT represent real prices.
+        """.strip()
     )
 
-    context = ssl.create_default_context()
+    try:
+        context = ssl.create_default_context()
 
-    with smtplib.SMTP_SSL(
-        "smtp.gmail.com",
-        465,
-        context=context,
-    ) as smtp:
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com",
+            465,
+            context=context,
+        ) as server:
 
-        smtp.login(
-            sender,
-            password,
-        )
-
-        smtp.send_message(
-            message
-        )
-
-
-# ============================================================
-# DEMO NOTIFICATION
-# ============================================================
-
-def demo_changes(config):
-    """
-    Create fake changes for testing the email system.
-    No real prices are used.
-    """
-
-    examples = [
-
-        (
-            "ASUS ROG Strix OLED XG32UCWMG",
-            "amazon",
-            799.99,
-            749.99,
-        ),
-
-        (
-            "Samsung Odyssey OLED G8 G80SD",
-            "mediamarkt",
-            798.87,
-            829.99,
-        ),
-
-        (
-            "LG UltraGear OLED 32GX850A-B",
-            "idealo",
-            629.00,
-            599.00,
-        ),
-    ]
-
-    monitors = {
-        monitor.get("name"): monitor
-        for monitor in config.get(
-            "monitors",
-            []
-        )
-    }
-
-    rows = []
-
-    for (
-        name,
-        source,
-        old,
-        new,
-    ) in examples:
-
-        monitor = monitors.get(
-            name,
-            {}
-        )
-
-        rows.append(
-            {
-                "monitor": name,
-                "source": source,
-                "old": old,
-                "new": new,
-                "url": monitor.get(
-                    source,
-                    "https://example.com/demo",
-                ),
-            }
-        )
-
-    return rows
-
-
-# ============================================================
-# README TABLE
-# ============================================================
-
-def build_readme_table(state):
-    """
-    Update the Current price table inside README.md.
-    """
-
-    lines = [
-
-        "## Current price table",
-
-        "",
-
-        "| Monitor | Amazon.de | MediaMarkt.de | Idealo.de | Last check |",
-
-        "|---|---:|---:|---:|---|",
-    ]
-
-    for monitor in state.get(
-        "monitors",
-        []
-    ):
-
-        values = {
-            item["source"]: item
-            for item in monitor.get(
-                "sources",
-                []
-            )
-        }
-
-        cells = []
-
-        for source in (
-            "amazon",
-            "mediamarkt",
-            "idealo",
-        ):
-
-            item = values.get(
-                source,
-                {}
+            server.login(
+                sender,
+                password,
             )
 
-            price = item.get(
-                "price"
-            )
+            server.send_message(message)
 
-            status = item.get(
-                "status",
-                ""
-            )
+        print("Demo email sent successfully.")
 
-            url = item.get(
-                "url",
-                ""
-            )
-
-            if price is not None:
-
-                if url:
-
-                    cell = (
-                        f"[€{price:.2f}]"
-                        f"({url})"
-                    )
-
-                else:
-
-                    cell = (
-                        f"€{price:.2f}"
-                    )
-
-            else:
-
-                cell = (
-                    f"`{status or 'N/A'}`"
-                )
-
-            cells.append(cell)
-
-        checked = monitor.get(
-            "last_checked",
-            ""
-        )
-
-        lines.append(
-            f"| {monitor['name']} | "
-            f"{cells[0]} | "
-            f"{cells[1]} | "
-            f"{cells[2]} | "
-            f"{checked} |"
-        )
-
-    table = "\n".join(lines)
-
-    if README.exists():
-
-        readme = README.read_text(
-            encoding="utf-8"
-        )
-
-    else:
-
-        readme = ""
-
-    marker = (
-        "## Current price table"
-    )
-
-    if marker in readme:
-
-        readme = (
-            readme
-            .split(marker)[0]
-            .rstrip()
-            + "\n\n"
-            + table
-            + "\n"
-        )
-
-    else:
-
-        readme = (
-            readme.rstrip()
-            + "\n\n"
-            + table
-            + "\n"
-        )
-
-    README.write_text(
-        readme,
-        encoding="utf-8",
-    )
+    except Exception as exc:
+        print(f"DEMO_EMAIL_ERROR: {type(exc).__name__}: {exc}")
 
 
 # ============================================================
-# MAIN PRICE TRACKING
-# ============================================================
-
-def run_tracker(config):
-    """
-    Main tracker process.
-    """
-
-    state = load_json(
-        STATE,
-        {
-            "monitors": []
-        }
-    )
-
-    old_state_by_model = {
-        monitor["model"]: monitor
-        for monitor in state.get(
-            "monitors",
-            []
-        )
-        if "model" in monitor
-    }
-
-    changes = []
-
-    now = (
-        datetime.now(timezone.utc)
-        .astimezone()
-        .isoformat(
-            timespec="minutes"
-        )
-    )
-
-    new_state = {
-        "updated_at": now,
-        "monitors": [],
-    }
-
-    with sync_playwright() as playwright:
-
-        browser = playwright.chromium.launch(
-            headless=True
-        )
-
-        try:
-
-            for monitor in config.get(
-                "monitors",
-                []
-            ):
-
-                name = monitor.get(
-                    "name",
-                    "Unknown monitor"
-                )
-
-                model = monitor.get(
-                    "model",
-                    name
-                )
-
-                print("")
-                print(
-                    "================================================"
-                )
-
-                print(
-                    f"Checking: {name}"
-                )
-
-                print(
-                    "================================================"
-                )
-
-                old_monitor = (
-                    old_state_by_model.get(
-                        model,
-                        {}
-                    )
-                )
-
-                old_sources = {
-                    item["source"]: item
-                    for item in old_monitor.get(
-                        "sources",
-                        []
-                    )
-                    if "source" in item
-                }
-
-                source_rows = []
-
-                for source in (
-                    "amazon",
-                    "mediamarkt",
-                    "idealo",
-                ):
-
-                    url = monitor.get(
-                        source,
-                        ""
-                    )
-
-                    print("")
-                    print(
-                        f"Checking {name} | "
-                        f"{source}"
-                    )
-
-                    price, status = fetch_price(
-                        browser,
-                        url,
-                        source,
-                    )
-
-                    if price is not None:
-
-                        print(
-                            f"Result: "
-                            f"€{price:.2f}"
-                        )
-
-                    else:
-
-                        print(
-                            f"Result: N/A "
-                            f"({status})"
-                        )
-
-                    old_item = (
-                        old_sources.get(
-                            source,
-                            {}
-                        )
-                    )
-
-                    old_price = (
-                        old_item.get(
-                            "price"
-                        )
-                    )
-
-                    # ------------------------------------------------
-                    # Detect price changes
-                    # ------------------------------------------------
-
-                    if (
-                        price is not None
-                        and old_price is not None
-                        and round(
-                            price,
-                            2
-                        )
-                        != round(
-                            float(old_price),
-                            2
-                        )
-                    ):
-
-                        changes.append(
-                            {
-                                "monitor": name,
-                                "source": source,
-                                "old": float(
-                                    old_price
-                                ),
-                                "new": float(
-                                    price
-                                ),
-                                "url": url,
-                            }
-                        )
-
-                        print(
-                            "PRICE CHANGE DETECTED!"
-                        )
-
-                    source_rows.append(
-                        {
-                            "source": source,
-                            "url": url,
-                            "price": price,
-                            "status": status,
-                        }
-                    )
-
-                new_state[
-                    "monitors"
-                ].append(
-                    {
-                        "name": name,
-                        "model": model,
-                        "last_checked": now,
-                        "sources": source_rows,
-                    }
-                )
-
-        finally:
-
-            browser.close()
-
-    # --------------------------------------------------------
-    # Save state
-    # --------------------------------------------------------
-
-    save_json(
-        STATE,
-        new_state
-    )
-
-    # --------------------------------------------------------
-    # Update README
-    # --------------------------------------------------------
-
-    build_readme_table(
-        new_state
-    )
-
-    # --------------------------------------------------------
-    # Send ONE combined email
-    # --------------------------------------------------------
-
-    if changes:
-
-        print("")
-        print(
-            f"Sending email for "
-            f"{len(changes)} price change(s)..."
-        )
-
-        send_email(
-            changes
-        )
-
-        print(
-            "Price-change email sent."
-        )
-
-    else:
-
-        print("")
-        print(
-            "No price changes."
-        )
-
-        print(
-            "No email sent."
-        )
-
-    print("")
-    print(
-        f"Checked "
-        f"{len(config.get('monitors', []))} "
-        f"monitors."
-    )
-
-    print(
-        f"Price changes: "
-        f"{len(changes)}"
-    )
-
-
-# ============================================================
-# PROGRAM ENTRY POINT
+# MAIN TRACKER
 # ============================================================
 
 def main():
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "Automatic OLED monitor "
-            "price tracker"
-        )
-    )
-
-    parser.add_argument(
-        "--demo-notification",
-        action="store_true",
-        help=(
-            "Send a clearly labelled "
-            "test email without checking "
-            "real prices."
-        ),
-    )
-
-    args = parser.parse_args()
-
-    # --------------------------------------------------------
-    # Load monitor configuration
-    # --------------------------------------------------------
+    print("=" * 70)
+    print("OLED MONITOR PRICE TRACKER")
+    print("=" * 70)
 
     config = load_json(
-        CONFIG,
-        {
-            "monitors": []
+        CONFIG_FILE,
+        [],
+    )
+
+    state = load_state()
+
+    if isinstance(config, dict):
+        monitors_config = config.get("monitors", [])
+    else:
+        monitors_config = config
+
+    changes = []
+
+    if "monitors" not in state:
+        state["monitors"] = {}
+
+    for monitor in monitors_config:
+
+        name = monitor.get("name")
+        model = monitor.get("model")
+
+        if not name or not model:
+            print("Skipping invalid monitor configuration.")
+            continue
+
+        print()
+        print("#" * 70)
+        print(f"MONITOR: {name}")
+        print(f"MODEL:   {model}")
+        print("#" * 70)
+
+        previous_data = state["monitors"].get(
+            name,
+            {
+                "prices": {},
+            },
+        )
+
+        previous_prices = previous_data.get(
+            "prices",
+            {},
+        )
+
+        current_prices = {}
+
+        retailers = [
+            "amazon",
+            "mediamarkt",
+            "idealo",
+        ]
+
+        for retailer in retailers:
+
+            result = search_for_price(
+                model,
+                retailer,
+            )
+
+            current_prices[retailer] = result["price"]
+
+            old_price = previous_prices.get(retailer)
+            new_price = result["price"]
+
+            direction = classify_change(
+                old_price,
+                new_price,
+            )
+
+            print(
+                f"{retailer}: "
+                f"old={old_price} "
+                f"new={new_price} "
+                f"change={direction}"
+            )
+
+            # Only compare prices when both values are valid.
+            if (
+                old_price is not None
+                and new_price is not None
+                and old_price != new_price
+            ):
+
+                changes.append(
+                    {
+                        "monitor": name,
+                        "source": retailer,
+                        "old_price": old_price,
+                        "new_price": new_price,
+                        "direction": direction,
+                    }
+                )
+
+        state["monitors"][name] = {
+            "model": model,
+            "prices": current_prices,
+            "last_checked": datetime.now(
+                timezone.utc
+            ).isoformat(),
         }
+
+    state["last_updated"] = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    save_json(
+        STATE_FILE,
+        state,
     )
 
-    monitors = config.get(
-        "monitors",
-        []
+    update_readme(
+        state["monitors"]
     )
 
-    if not monitors:
+    print()
+    print("=" * 70)
+    print(f"PRICE CHANGES DETECTED: {len(changes)}")
+    print("=" * 70)
 
-        raise RuntimeError(
-            "No monitors found in "
-            "config/monitors.json"
-        )
-
-    # --------------------------------------------------------
-    # Demo email
-    # --------------------------------------------------------
-
-    if args.demo_notification:
-
+    for change in changes:
         print(
-            "Sending demo notification..."
+            f"{change['monitor']} | "
+            f"{change['source']} | "
+            f"€{change['old_price']:.2f} → "
+            f"€{change['new_price']:.2f}"
         )
 
-        changes = demo_changes(
-            config
-        )
+    # One combined email per run.
+    send_email(changes)
 
-        send_email(
-            changes,
-            demo=True
-        )
+    print()
+    print("Tracker finished.")
 
-        print(
-            "Demo notification sent successfully."
-        )
 
-        return
-
-    # --------------------------------------------------------
-    # Normal tracker
-    # --------------------------------------------------------
-
-    run_tracker(
-        config
-    )
-
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
